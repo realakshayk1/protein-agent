@@ -1,0 +1,603 @@
+# PRD: Autonomous Protein Engineering Agent
+
+**Project Type:** Applied AI / Scientific Agent Engineering  
+**Timeline:** 8–10 weeks  
+**Compute:** Laptop + API credits (inference-only, no training)  
+**Priority:** Agent orchestration correctness + scientific evaluation rigor  
+**Status:** Not started
+
+---
+
+## 1. Problem Statement
+
+Protein engineers iterating on a target (improve thermostability, retain binding affinity, eliminate immunogenicity) currently run each computational tool — structure prediction, sequence scoring, homology analysis — as separate manual steps, stitching together results by hand across different interfaces and file formats. This is slow, error-prone, and doesn't scale when evaluating hundreds of candidates.
+
+Recent bio foundation models (ESM-2, ESMFold, RFdiffusion) have made individual steps dramatically faster, but they remain disconnected tools requiring significant domain expertise to operate and interpret together. No open, lightweight system chains them into a coherent reasoning loop that a researcher can query in natural language.
+
+**This project asks:** Can an LLM-orchestrated agent autonomously decompose a natural language protein engineering objective into a multi-step tool plan, execute that plan across bio foundation models, and return scientifically justified candidate rankings — reproducibly and with transparent reasoning?
+
+**Scientific hypothesis:** An agent that combines ESM-2 log-likelihood scoring, ESMFold structure prediction, and BLAST conservation analysis can rank engineered protein variants with higher Spearman correlation to experimental thermostability measurements than any single model in isolation, because each tool captures orthogonal signals (sequence fitness, structural plausibility, evolutionary conservation).
+
+---
+
+## 2. Scope Definition
+
+### What this agent does
+- Accepts a natural language protein engineering task as input
+- Parses the task into a structured goal (target protein, desired property, constraints)
+- Generates or accepts a set of candidate variant sequences
+- Orchestrates a defined tool pipeline over each candidate
+- Returns a ranked list of candidates with per-candidate evidence cards
+- Streams intermediate reasoning steps to the interface in real time
+
+### What this agent does not do
+- Generate sequences de novo via diffusion (RFdiffusion is out of scope — inference cost)
+- Run wet lab validation
+- Handle multi-chain complexes or protein-protein interactions
+- Replace any individual tool; it orchestrates existing ones
+- Learn or fine-tune from user feedback (stateless across sessions)
+
+---
+
+## 3. Goals & Success Metrics
+
+### Primary
+| Metric | Target | Notes |
+|--------|--------|-------|
+| Spearman ρ (agent ranking vs. experimental) | > 0.55 | Evaluated on ProtaBank thermostability benchmark |
+| Spearman ρ (best single tool vs. experimental) | Baseline to beat | ESM-2 alone typically ρ ≈ 0.40–0.50 |
+| Tool call success rate | > 95% on 50-variant batch | With retry logic |
+| End-to-end latency for 20-variant batch | < 3 minutes | Laptop + API |
+| Agent correctly refuses malformed inputs | 100% | With structured error messages |
+
+### Secondary
+| Metric | Target |
+|--------|--------|
+| Per-tool ablation: removing each tool degrades ranking | Demonstrated |
+| Agent reasoning trace is auditable step-by-step | Yes — streamed to UI |
+| ESM log-likelihood, pLDDT, TM-score all present per candidate | Yes |
+
+---
+
+## 4. Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        User Interface                        │
+│          React frontend — task input, streaming trace,       │
+│          results table with sortable evidence columns        │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ HTTP / SSE
+┌───────────────────────▼─────────────────────────────────────┐
+│                     FastAPI Backend                          │
+│                                                              │
+│   POST /analyze  — submit task + sequences                   │
+│   GET  /stream   — SSE stream of agent trace events         │
+│   GET  /results  — ranked candidate JSON                     │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+┌───────────────────────▼─────────────────────────────────────┐
+│                  Agent Orchestrator                          │
+│            Claude API (claude-sonnet-4-5)                    │
+│                                                              │
+│  1. Parse task → structured goal (protein, property,        │
+│     constraints, candidate sequences)                        │
+│  2. Plan tool execution order                                │
+│  3. Execute tool loop (tool_use blocks)                      │
+│  4. Aggregate results into evidence cards                    │
+│  5. Rank candidates, generate justification                  │
+└──┬──────────────┬──────────────┬───────────────┬────────────┘
+   │              │              │               │
+┌──▼───┐    ┌────▼────┐   ┌─────▼────┐   ┌─────▼──────┐
+│ ESM  │    │ESMFold  │   │  BLAST   │   │  TM-align  │
+│  -2  │    │(ESMFold │   │ (NCBI or │   │ (local,    │
+│(HF)  │    │ API)    │   │  local)  │   │  tmalign   │
+│      │    │         │   │          │   │  binary)   │
+│log-  │    │pLDDT,   │   │conserv-  │   │TM-score vs │
+│like- │    │struct   │   │ation at  │   │reference   │
+│lihood│    │PDB      │   │mutated   │   │structure   │
+└──────┘    └─────────┘   │positions │   └────────────┘
+                          └──────────┘
+```
+
+### Agent Tool Definitions (Claude tool_use schema)
+
+```python
+tools = [
+    {
+        "name": "score_sequence_esm2",
+        "description": "Compute ESM-2 log-likelihood ratio (variant vs. wildtype) "
+                       "for a protein sequence. Returns per-position scores and aggregate LLR.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wildtype_seq": {"type": "string"},
+                "variant_seq": {"type": "string"},
+                "model_size": {"type": "string", "enum": ["esm2_t6_8M", "esm2_t12_35M", "esm2_t30_150M"],
+                               "default": "esm2_t12_35M"}
+            },
+            "required": ["wildtype_seq", "variant_seq"]
+        }
+    },
+    {
+        "name": "predict_structure_esmfold",
+        "description": "Predict 3D structure of a protein sequence using ESMFold. "
+                       "Returns pLDDT (confidence) scores and PDB string.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequence": {"type": "string"},
+                "candidate_id": {"type": "string"}
+            },
+            "required": ["sequence", "candidate_id"]
+        }
+    },
+    {
+        "name": "compute_structural_similarity",
+        "description": "Compute TM-score between a predicted structure and a reference PDB. "
+                       "Returns TM-score (0-1, higher = more similar) and RMSD.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "predicted_pdb": {"type": "string", "description": "PDB string from ESMFold"},
+                "reference_pdb_id": {"type": "string", "description": "PDB ID or local path"}
+            },
+            "required": ["predicted_pdb", "reference_pdb_id"]
+        }
+    },
+    {
+        "name": "blast_conservation",
+        "description": "Run BLAST on a sequence to assess evolutionary conservation "
+                       "at mutated positions. Returns per-position conservation scores.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequence": {"type": "string"},
+                "mutated_positions": {"type": "array", "items": {"type": "integer"}},
+                "db": {"type": "string", "default": "nr", "enum": ["nr", "swissprot", "pdb"]}
+            },
+            "required": ["sequence", "mutated_positions"]
+        }
+    },
+    {
+        "name": "rank_candidates",
+        "description": "Given evidence cards for all candidates, compute composite ranking. "
+                       "Returns ordered list with scores and per-factor justification.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "candidates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "llr": {"type": "number"},
+                            "mean_plddt": {"type": "number"},
+                            "tm_score": {"type": "number"},
+                            "conservation_score": {"type": "number"}
+                        }
+                    }
+                },
+                "weights": {"type": "object", "description": "Optional per-metric weights"}
+            },
+            "required": ["candidates"]
+        }
+    }
+]
+```
+
+---
+
+## 5. Tool Implementations
+
+### 5.1 ESM-2 Scoring (local, HuggingFace)
+```python
+import torch
+from transformers import EsmTokenizer, EsmForMaskedLM
+
+def score_sequence_esm2(wildtype_seq: str, variant_seq: str,
+                         model_name: str = "esm2_t12_35M_UR50D") -> dict:
+    """
+    Compute log-likelihood ratio: log P(variant) - log P(wildtype).
+    Uses masked marginal scoring (Meier et al. 2021).
+    Positive LLR = variant is more fit than wildtype per ESM-2.
+    """
+    tokenizer = EsmTokenizer.from_pretrained(f"facebook/{model_name}")
+    model = EsmForMaskedLM.from_pretrained(f"facebook/{model_name}")
+    model.eval()
+
+    def sequence_log_likelihood(seq: str) -> float:
+        # Mask each position in turn, sum log P(true token | context)
+        tokens = tokenizer(seq, return_tensors="pt")
+        total_ll = 0.0
+        with torch.no_grad():
+            for i in range(1, tokens["input_ids"].shape[1] - 1):  # skip BOS/EOS
+                masked = tokens["input_ids"].clone()
+                true_token = masked[0, i].item()
+                masked[0, i] = tokenizer.mask_token_id
+                logits = model(input_ids=masked).logits
+                log_probs = torch.log_softmax(logits[0, i], dim=-1)
+                total_ll += log_probs[true_token].item()
+        return total_ll
+
+    wt_ll  = sequence_log_likelihood(wildtype_seq)
+    var_ll = sequence_log_likelihood(variant_seq)
+
+    # Per-position breakdown at mutated sites
+    mutated_positions = [i for i, (w, v) in enumerate(zip(wildtype_seq, variant_seq)) if w != v]
+
+    return {
+        "llr": var_ll - wt_ll,
+        "wildtype_ll": wt_ll,
+        "variant_ll": var_ll,
+        "mutated_positions": mutated_positions,
+        "n_mutations": len(mutated_positions)
+    }
+```
+
+### 5.2 ESMFold Structure Prediction (via API)
+```python
+import requests
+
+def predict_structure_esmfold(sequence: str, candidate_id: str) -> dict:
+    """
+    ESMFold inference via Meta's public API endpoint.
+    Returns pLDDT per residue + full PDB string.
+    Falls back to local ESMFold if API unavailable (requires 16GB+ RAM).
+    """
+    url = "https://api.esmatlas.com/foldSequence/v1/pdb/"
+    response = requests.post(url, data=sequence, timeout=120)
+    response.raise_for_status()
+    pdb_string = response.text
+
+    # Extract pLDDT from B-factor column of PDB
+    plddt_scores = []
+    for line in pdb_string.splitlines():
+        if line.startswith("ATOM") and line[12:16].strip() == "CA":
+            plddt_scores.append(float(line[60:66].strip()))
+
+    return {
+        "candidate_id": candidate_id,
+        "pdb_string": pdb_string,
+        "mean_plddt": sum(plddt_scores) / len(plddt_scores) if plddt_scores else 0.0,
+        "plddt_per_residue": plddt_scores,
+        "length": len(sequence)
+    }
+```
+
+### 5.3 TM-score (local binary)
+```python
+import subprocess, tempfile, os, re
+
+def compute_structural_similarity(predicted_pdb: str, reference_pdb_path: str) -> dict:
+    """
+    Run TM-align binary to compute TM-score and RMSD.
+    TM-score: 0-1, >0.5 = same fold, >0.7 = structurally similar.
+    Requires TMalign binary on PATH (download from Zhang lab).
+    """
+    with tempfile.NamedTemporaryFile(suffix=".pdb", mode="w", delete=False) as f:
+        f.write(predicted_pdb)
+        pred_path = f.name
+    try:
+        result = subprocess.run(
+            ["TMalign", pred_path, reference_pdb_path],
+            capture_output=True, text=True, timeout=30
+        )
+        output = result.stdout
+        tm_scores = re.findall(r"TM-score=\s*([\d.]+)", output)
+        rmsd = re.search(r"RMSD=\s*([\d.]+)", output)
+        return {
+            "tm_score_chain1": float(tm_scores[0]) if tm_scores else None,
+            "tm_score_chain2": float(tm_scores[1]) if len(tm_scores) > 1 else None,
+            "rmsd": float(rmsd.group(1)) if rmsd else None
+        }
+    finally:
+        os.unlink(pred_path)
+```
+
+### 5.4 Composite Ranker
+```python
+import numpy as np
+from scipy.stats import rankdata
+
+def rank_candidates(candidates: list[dict],
+                    weights: dict = None) -> list[dict]:
+    """
+    Composite ranking via weighted rank aggregation.
+    Default weights calibrated on ProtaBank thermostability pilot.
+    """
+    default_weights = {
+        "llr": 0.40,            # ESM-2 sequence fitness
+        "mean_plddt": 0.25,     # structural confidence
+        "tm_score": 0.20,       # fold retention
+        "conservation_score": 0.15  # evolutionary support
+    }
+    w = weights or default_weights
+
+    # Normalize each metric to [0,1], rank, weighted sum
+    metrics = ["llr", "mean_plddt", "tm_score", "conservation_score"]
+    scores = np.array([[c.get(m, 0.0) for m in metrics] for c in candidates])
+
+    # Handle missing values (set to column mean)
+    col_means = np.nanmean(scores, axis=0)
+    for i, j in zip(*np.where(np.isnan(scores))):
+        scores[i, j] = col_means[j]
+
+    # Rank each metric (higher = better for all)
+    ranks = np.apply_along_axis(rankdata, 0, scores)
+    weight_vec = np.array([w[m] for m in metrics])
+    composite = ranks @ weight_vec
+
+    # Attach scores back to candidates
+    for i, cand in enumerate(candidates):
+        cand["composite_score"] = float(composite[i])
+        cand["rank"] = int(len(candidates) - rankdata(composite)[i] + 1)
+
+    return sorted(candidates, key=lambda x: x["composite_score"], reverse=True)
+```
+
+---
+
+## 6. Agent Orchestration Loop
+
+```python
+import anthropic
+import json
+
+client = anthropic.Anthropic()
+
+SYSTEM_PROMPT = """You are a protein engineering agent. Given a protein engineering task,
+you orchestrate computational biology tools to evaluate candidate sequences and return
+scientifically justified rankings.
+
+For each task you must:
+1. Parse the goal: identify target protein, desired property, constraints
+2. For each candidate sequence, call tools in this order:
+   a. score_sequence_esm2 (sequence fitness)
+   b. predict_structure_esmfold (structural confidence)
+   c. compute_structural_similarity (fold retention vs. reference)
+   d. blast_conservation (evolutionary support at mutated positions)
+3. Call rank_candidates with aggregated evidence
+4. Return a structured summary with top candidates and per-factor justification
+
+Always call tools before drawing conclusions. Never hallucinate scores.
+If a tool fails, note the failure in your reasoning and proceed without that signal."""
+
+def run_agent(task: str, sequences: dict[str, str], wildtype: str,
+              reference_pdb_path: str, stream_callback=None) -> dict:
+    """
+    Main agent loop. Runs until no more tool_use blocks returned.
+    stream_callback: optional function called with each reasoning step string.
+    """
+    messages = [{"role": "user", "content": f"Task: {task}\n\nWildtype: {wildtype}\n\n"
+                                             f"Candidates: {json.dumps(sequences)}"}]
+
+    tool_implementations = {
+        "score_sequence_esm2": score_sequence_esm2,
+        "predict_structure_esmfold": predict_structure_esmfold,
+        "compute_structural_similarity": compute_structural_similarity,
+        "blast_conservation": blast_conservation,
+        "rank_candidates": rank_candidates,
+    }
+
+    while True:
+        response = client.messages.create(
+            model="claude-sonnet-4-5-20251022",
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            tools=tools,
+            messages=messages
+        )
+
+        # Stream any text blocks
+        for block in response.content:
+            if block.type == "text" and stream_callback:
+                stream_callback({"type": "reasoning", "text": block.text})
+
+        # If no tool use, agent is done
+        if response.stop_reason == "end_turn":
+            final_text = next((b.text for b in response.content if b.type == "text"), "")
+            return {"status": "complete", "summary": final_text}
+
+        # Execute all tool calls
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+
+            if stream_callback:
+                stream_callback({"type": "tool_call", "tool": block.name,
+                                 "input": block.input})
+            try:
+                result = tool_implementations[block.name](**block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result)
+                })
+                if stream_callback:
+                    stream_callback({"type": "tool_result", "tool": block.name,
+                                     "result": result})
+            except Exception as e:
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": f"Error: {str(e)}",
+                    "is_error": True
+                })
+
+        # Append assistant turn + tool results
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+```
+
+---
+
+## 7. Evaluation Benchmark
+
+### 7.1 Dataset: ProtaBank Thermostability Subset
+- Source: ProtaBank (public, protabank.org) — experimental ΔTm measurements for point mutants
+- Target protein: **TEM-1 β-lactamase** or **GB1** (both have large public mutational scan datasets)
+- Use: **GB1 4-mutation combinatorial dataset** (Olson et al. 2014, ~150k variants, experimental fitness scores)
+- For benchmarking, sample 100 variants stratified across fitness quartiles
+
+### 7.2 Benchmark Protocol
+```python
+# For each of 100 sampled variants:
+# 1. Run agent pipeline → get composite_score per variant
+# 2. Compare to experimental fitness score (log enrichment)
+# 3. Compute Spearman ρ between agent ranking and experimental ranking
+# 4. Repeat for each single-tool ablation (ESM-2 only, pLDDT only, etc.)
+
+from scipy.stats import spearmanr
+
+def benchmark(agent_scores: list[float], experimental_scores: list[float]) -> dict:
+    rho, pval = spearmanr(agent_scores, experimental_scores)
+    return {"spearman_rho": rho, "p_value": pval, "n": len(agent_scores)}
+```
+
+### 7.3 Ablation Table (to report)
+| Condition | Spearman ρ | Notes |
+|-----------|-----------|-------|
+| Full agent (all 4 tools) | TBD | Primary result |
+| ESM-2 LLR only | TBD | Sequence fitness alone |
+| ESMFold pLDDT only | TBD | Structure confidence alone |
+| TM-score only | TBD | Fold retention alone |
+| BLAST conservation only | TBD | Evolution alone |
+| Random baseline | ~0.0 | Sanity check |
+
+---
+
+## 8. API + Interface
+
+### 8.1 FastAPI Backend
+```
+POST /analyze
+  Body: { task: str, wildtype: str, candidates: {id: seq}, reference_pdb_id: str }
+  Returns: { job_id: str }
+
+GET /stream/{job_id}
+  SSE stream of: reasoning steps, tool calls, tool results, final ranking
+
+GET /results/{job_id}
+  Returns: { ranked_candidates: [...], summary: str, benchmark_scores: {...} }
+```
+
+### 8.2 React Frontend (minimal, functional)
+- Text area for task description in natural language
+- FASTA paste area for candidate sequences
+- Live trace panel: streams agent reasoning + tool calls in real time
+- Results table: sortable by any evidence column (LLR, pLDDT, TM-score, composite)
+- Export to CSV button
+- Single-page app, no auth required
+
+### 8.3 Docker Compose Stack
+```yaml
+services:
+  backend:
+    build: ./backend
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    ports: ["8000:8000"]
+    volumes:
+      - ./reference_pdbs:/app/reference_pdbs
+      - ./esm_cache:/app/esm_cache    # cache ESM-2 model weights locally
+
+  frontend:
+    build: ./frontend
+    ports: ["3000:3000"]
+    depends_on: [backend]
+```
+
+---
+
+## 9. Task Breakdown
+
+### Phase 1: Tool Implementations (Weeks 1–2)
+- [ ] **T1.1** Set up conda env: transformers, anthropic, fastapi, biopython, scipy, requests
+- [ ] **T1.2** Implement and unit-test `score_sequence_esm2` on GB1 wildtype vs. 5 known variants
+- [ ] **T1.3** Implement and test `predict_structure_esmfold` — verify pLDDT extraction from PDB B-factors
+- [ ] **T1.4** Download TM-align binary, implement and test `compute_structural_similarity`
+- [ ] **T1.5** Implement `blast_conservation` using BioPython NCBI BLAST wrapper (remote API)
+- [ ] **T1.6** Implement `rank_candidates` with weighted rank aggregation
+- [ ] **T1.7** Write unit tests for each tool: known input → expected output range
+
+### Phase 2: Agent Orchestration (Week 3)
+- [ ] **T2.1** Define all 5 tool schemas in Claude tool_use format
+- [ ] **T2.2** Implement `run_agent` loop with tool dispatch and error handling
+- [ ] **T2.3** Write system prompt, test on 3 manually constructed tasks
+- [ ] **T2.4** Verify agent calls tools in correct order; test retry logic on simulated tool failure
+- [ ] **T2.5** Add stream_callback emission for each reasoning step and tool call
+- [ ] **T2.6** End-to-end test: 5-variant batch, verify all tools called, ranking returned
+
+### Phase 3: API + Frontend (Week 4)
+- [ ] **T3.1** Build FastAPI: `/analyze`, `/stream/{job_id}`, `/results/{job_id}` endpoints
+- [ ] **T3.2** Implement SSE streaming of agent trace events
+- [ ] **T3.3** Build React frontend: task input, FASTA paste, live trace panel
+- [ ] **T3.4** Build results table: sortable columns, CSV export
+- [ ] **T3.5** Docker Compose stack: backend + frontend, env var injection
+- [ ] **T3.6** Smoke test: submit task via UI, see trace stream, get ranked results
+
+### Phase 4: Benchmark (Weeks 5–6)
+- [ ] **T4.1** Download GB1 combinatorial dataset (Olson et al. 2014)
+- [ ] **T4.2** Sample 100 variants stratified by fitness quartile, save as benchmark set
+- [ ] **T4.3** Run full agent pipeline on all 100 variants (batched, ~2–3 hrs with API rate limits)
+- [ ] **T4.4** Compute Spearman ρ for full agent and all single-tool ablations
+- [ ] **T4.5** Generate result table + scatter plot (agent score vs. experimental fitness)
+- [ ] **T4.6** Add benchmark results to README
+
+### Phase 5: Polish (Weeks 7–8)
+- [ ] **T5.1** Write README: problem, architecture diagram, quickstart, benchmark results
+- [ ] **T5.2** Add `scripts/run_benchmark.py` as standalone reproducible script
+- [ ] **T5.3** Cache ESM-2 weights locally (avoid re-download per run)
+- [ ] **T5.4** Add request validation: sequence length limits, character validation, FASTA parsing
+- [ ] **T5.5** Push public to GitHub
+
+---
+
+## 10. Key References
+
+1. **Meier et al. 2021** — "Language models enable zero-shot prediction of the effects of mutations on protein function" — ESM-1v masked marginal scoring method
+2. **Lin et al. 2023** — "Evolutionary-scale prediction of atomic-level protein structure with a language model" — ESMFold
+3. **Zhang & Skolnick 2005** — "TM-align: a protein structure alignment algorithm" — TM-score metric
+4. **Olson et al. 2014** — "A comprehensive biophysical description of pairwise epistasis throughout an entire protein domain" — GB1 benchmark dataset
+5. **Notin et al. 2022** — "Tranception: Protein Fitness Prediction with Autoregressive Transformers and Inference-time Retrieval" — state-of-the-art single-model comparison point
+
+---
+
+## 11. Risks & Mitigations
+
+| Risk | Likelihood | Mitigation |
+|------|-----------|------------|
+| ESMFold public API rate-limited or down | Medium | Cache all predictions; fall back to local ESMFold (slow but functional on 16GB RAM) |
+| BLAST remote API slow for 100-variant benchmark | High | Use local BLAST+ with swissprot DB (~7GB download); run once, cache results |
+| Claude API costs for 100-variant benchmark | Low | Estimate: ~$2–5 total at Sonnet pricing; acceptable |
+| Agent calls tools in wrong order | Medium | System prompt specifies order explicitly; add order validation in tool dispatch |
+| GB1 dataset experimental scores don't correlate with agent | Medium | This is a valid scientific finding — report it honestly with analysis of why |
+| ESM-2 model weights too large for laptop RAM | Low | Use `esm2_t6_8M` (31MB) for development; `esm2_t12_35M` (150MB) for final benchmark |
+
+---
+
+## 12. Assumptions
+
+- Anthropic API key available with Sonnet access
+- Laptop has ≥ 16GB RAM (ESM-2 35M model requires ~2GB; ESMFold local requires ~16GB)
+- Internet access for ESMFold API and BLAST remote (or local BLAST+ installed)
+- TM-align binary downloadable from Zhang lab (free, no license)
+- GB1 dataset publicly available via Supplement of Olson et al. 2014
+
+---
+
+## 13. Out of Scope
+
+- De novo sequence generation (RFdiffusion, ProteinMPNN)
+- Multi-chain or protein-protein interaction analysis
+- Fine-tuning any foundation model
+- User authentication or multi-user sessions
+- Integration with wet lab ordering or ELN systems
+- Support for DNA/RNA sequences
+
+---
+
+*April 2026*    
