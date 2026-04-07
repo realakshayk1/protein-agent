@@ -26,6 +26,9 @@ def predict_structure_esmfold(
     if not plddt_scores:
         raise ValueError(f"Could not extract pLDDT scores from ESMFold response for {candidate_id}")
 
+    if all(p <= 1.0 for p in plddt_scores):
+        plddt_scores = [p * 100.0 for p in plddt_scores]
+
     return ESMFoldResult(
         candidate_id=candidate_id,
         pdb_string=pdb_string,
