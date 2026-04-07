@@ -36,6 +36,12 @@ Recent bio foundation models (ESM-2, ESMFold, RFdiffusion) have made individual 
 - Handle multi-chain complexes or protein-protein interactions
 - Replace any individual tool; it orchestrates existing ones
 - Learn or fine-tune from user feedback (stateless across sessions)
+- Handle complex co-factors or PTMs (post-translational modifications)
+
+### 2.3. Biological Truthfulness (Production Standard)
+- **Zero Mock Tolerance:** The final product MUST NOT use mock inputs or simulated data.
+- **Real Truths Only:** All tool outputs must be derived from validated biological foundation models (ESM-2, ESMFold) or scientific databases (NCBI BLAST/SwissProt).
+- **No Synthetic Shortcuts:** Results must reflect genuine biophysical predictions, ensuring the agent's reasoning is grounded in scientific reality.
 
 ---
 
@@ -56,6 +62,7 @@ Recent bio foundation models (ESM-2, ESMFold, RFdiffusion) have made individual 
 | Per-tool ablation: removing each tool degrades ranking | Demonstrated |
 | Agent reasoning trace is auditable step-by-step | Yes — streamed to UI |
 | ESM log-likelihood, pLDDT, TM-score all present per candidate | Yes |
+| Zero Simulation Dependency | 100% | No mock signals in final benchmark |
 
 ---
 
@@ -576,6 +583,7 @@ services:
 | Agent calls tools in wrong order | Medium | System prompt specifies order explicitly; add order validation in tool dispatch |
 | GB1 dataset experimental scores don't correlate with agent | Medium | This is a valid scientific finding — report it honestly with analysis of why |
 | ESM-2 model weights too large for laptop RAM | Low | Use `esm2_t6_8M` (31MB) for development; `esm2_t12_35M` (150MB) for final benchmark |
+| Mock data leakage into final production | Medium | Strict removal of `tools/mock_implementations.py` before final benchmark; ensure no tool returns "MOCK_PDB" or fixed scores. |
 
 ---
 
@@ -597,6 +605,7 @@ services:
 - User authentication or multi-user sessions
 - Integration with wet lab ordering or ELN systems
 - Support for DNA/RNA sequences
+- Mock sequences or synthetic datasets where experimental ground truth is not verified.
 
 ---
 

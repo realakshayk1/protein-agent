@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+/esm_cache/
+/data/
+/reference_pdbs/*.pdb
+!/reference_pdbs/.gitkeep
+/tests/.pytest_cache/
+.env
