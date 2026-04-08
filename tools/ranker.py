@@ -43,8 +43,9 @@ def rank_candidates(candidates: list[dict], weights: dict = None) -> RankerResul
     )
 
     # Replace NaN with column mean
-    col_means = np.nanmean(scores, axis=0)
-    col_means = np.nan_to_num(col_means, nan=0.0)
+    with np.errstate(all="ignore"):
+        col_means = np.nanmean(scores, axis=0)
+    col_means = np.where(np.isnan(col_means), 0.0, col_means)
     nan_mask = np.isnan(scores)
     for col_idx in range(scores.shape[1]):
         scores[nan_mask[:, col_idx], col_idx] = col_means[col_idx]
