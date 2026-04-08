@@ -31,6 +31,11 @@ class BLASTResult:
     n_hits: int
 
 @dataclass
+class RankerResult:
+    ranked_candidates: list[dict]
+    weights_used: dict
+
+@dataclass
 class RankedCandidate:
     candidate_id: str
     sequence: str
@@ -70,4 +75,4 @@ def blast_conservation(
 def rank_candidates(
     candidates: list[dict],   # each dict has candidate_id, sequence, + optional scores
     weights: dict | None = None
-) -> list[RankedCandidate]: ...
+) -> RankerResult: ...
