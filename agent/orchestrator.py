@@ -20,6 +20,7 @@ def run_agent(
     reference_pdb_path: str,
     stream_callback: Callable = None,
     blast_workers: int = 3,
+    esm2_model: str = "esm2_t6_8M_UR50D",
 ) -> Dict[str, Any]:
     """
     Execute the full 5-stage protein evaluation pipeline.
@@ -39,6 +40,9 @@ def run_agent(
         reference_pdb_path: Path to wild-type PDB file for TM-align comparison.
         stream_callback: Optional callable receiving progress events as dicts.
         blast_workers: Concurrent BLAST threads (default 3, respects NCBI limits).
+        esm2_model: HuggingFace model name for ESM-2 scoring.
+                    Use "esm2_t6_8M_UR50D" for quick tests,
+                    "esm2_t12_35M_UR50D" for the production benchmark.
 
     Returns:
         Dict with keys: status, ranked_candidates, weights_used,
@@ -80,7 +84,7 @@ def run_agent(
         emit({"type": "tool_call", "tool": "score_sequence_esm2", "candidate_id": cand_id, "stage": 1})
         tool_call_log.append("score_sequence_esm2")
         try:
-            res = score_sequence_esm2(wildtype, seq)
+            res = score_sequence_esm2(wildtype, seq, model_name=esm2_model)
             esm2_results[cand_id] = res
             emit({"type": "tool_result", "tool": "score_sequence_esm2", "candidate_id": cand_id, "success": True, "imputed": False})
         except Exception as exc:

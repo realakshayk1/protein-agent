@@ -4,16 +4,19 @@ Phase 4 FLIP GB1 Benchmark
 Evaluates the protein-engineering agent on 100 GB1 variants stratified across
 fitness quartiles.  Outputs:
 
-  scripts/results/benchmark_results.json   – raw scores + metadata
-  scripts/results/scatter_full_agent.png   – composite score vs experimental fitness
-  scripts/results/scatter_ablations.png    – 2x2 grid: single-tool correlations
-  scripts/results/scatter_residuals.png    – signed residual plot for edge-case ID
-  scripts/results/spearman_table.txt       – formatted correlation table
+  scripts/results/benchmark_results.json   -- raw scores + metadata
+  scripts/results/scatter_full_agent.png   -- composite score vs experimental fitness
+  scripts/results/scatter_ablations.png    -- 2x2 grid: single-tool correlations
+  scripts/results/scatter_residuals.png    -- signed residual plot for edge-case ID
+  scripts/results/spearman_table.txt       -- formatted correlation table
+
+After a successful run the Spearman table in README.md is updated automatically.
 
 Usage (from repo root):
-    python scripts/run_benchmark.py                  # full 100-variant run
-    python scripts/run_benchmark.py --n 20           # quick smoke-test
-    python scripts/run_benchmark.py --no-blast       # skip BLAST (faster)
+    python scripts/run_benchmark.py                        # full 100-variant run
+    python scripts/run_benchmark.py --n 20                 # quick smoke-test
+    python scripts/run_benchmark.py --no-blast             # skip BLAST (faster)
+    python scripts/run_benchmark.py --model esm2_t6_8M_UR50D  # override ESM-2 model
 """
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ from scipy.stats import spearmanr
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from agent.orchestrator import run_agent
+from tools.blast import local_blast_available
 from tools.validation import mutation_count, sequence_identity
 
 # ---------------------------------------------------------------------------
@@ -38,9 +42,12 @@ from tools.validation import mutation_count, sequence_identity
 # ---------------------------------------------------------------------------
 DATA_PATH = os.path.join("data", "gb1_fitness.csv")
 REFERENCE_PDB = "gb1_wt.pdb"
+README_PATH = os.path.join(os.path.dirname(__file__), "..", "README.md")
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 RANDOM_SEED = 42
-TARGET_PER_QUARTILE = 25   # 4 × 25 = 100 total variants
+TARGET_PER_QUARTILE = 25      # 4 x 25 = 100 total variants
+# PRD specifies esm2_t12_35M for the production benchmark (vs. 8M for dev/tests)
+DEFAULT_ESM2_MODEL = "esm2_t12_35M_UR50D"
 
 
 # ---------------------------------------------------------------------------
@@ -280,20 +287,118 @@ def identify_edge_cases(
 
 
 # ---------------------------------------------------------------------------
+# README auto-update
+# ---------------------------------------------------------------------------
+
+def update_readme(
+    spearman: dict,
+    n_variants: int,
+    esm2_model: str,
+    readme_path: str = README_PATH,
+) -> None:
+    """
+    Replace the TBD placeholder rows in the README benchmark table with real
+    Spearman values from the completed run.
+
+    Looks for lines of the form:
+        | **Full Agent (all tools)** | **TBD**   | TBD     |
+    and replaces with actual numbers.  Safe to call even if the format has
+    changed — prints a warning and skips rather than corrupting the file.
+    """
+    import re
+
+    if not os.path.exists(readme_path):
+        print(f"  [warn] README not found at {readme_path} — skipping auto-update")
+        return
+
+    with open(readme_path, encoding="utf-8") as fh:
+        content = fh.read()
+
+    def _fmt_rho(rho: float) -> str:
+        return f"**{rho:.3f}**" if rho >= 0.55 else f"{rho:.3f}"
+
+    def _fmt_p(p: float) -> str:
+        return "< 0.001" if p < 0.001 else f"{p:.4f}"
+
+    replacements = [
+        # (old_fragment, new_fragment)
+        (
+            r"\|\s*\*\*Full Agent \(all tools\)\*\*\s*\|\s*\*\*TBD\*\*.*?\|.*?\|",
+            f"| **Full Agent (all tools)** | {_fmt_rho(spearman['full_agent']['rho'])} "
+            f"| {_fmt_p(spearman['full_agent']['p'])} |",
+        ),
+        (
+            r"\|\s*ESM-2 LLR only\s*\|\s*TBD.*?\|.*?\|",
+            f"| ESM-2 LLR only           | {spearman['esm2_only']['rho']:.3f} "
+            f"| {_fmt_p(spearman['esm2_only']['p'])} |",
+        ),
+        (
+            r"\|\s*ESMFold pLDDT only\s*\|\s*TBD.*?\|.*?\|",
+            f"| ESMFold pLDDT only       | {spearman['plddt_only']['rho']:.3f} "
+            f"| {_fmt_p(spearman['plddt_only']['p'])} |",
+        ),
+        (
+            r"\|\s*TM-score only\s*\|\s*TBD.*?\|.*?\|",
+            f"| TM-score only            | {spearman['tm_only']['rho']:.3f} "
+            f"| {_fmt_p(spearman['tm_only']['p'])} |",
+        ),
+        (
+            r"\|\s*BLAST conservation only\s*\|\s*TBD.*?\|.*?\|",
+            f"| BLAST conservation only  | {spearman['blast_only']['rho']:.3f} "
+            f"| {_fmt_p(spearman['blast_only']['p'])} |",
+        ),
+    ]
+
+    updated = content
+    changed = 0
+    for pattern, replacement in replacements:
+        new, n = re.subn(pattern, replacement, updated)
+        if n:
+            updated = new
+            changed += n
+
+    if not changed:
+        print("  [warn] README benchmark table not found in expected format — skipping auto-update")
+        return
+
+    # Append run metadata note beneath the table if not already present
+    meta_note = (
+        f"\n> Last benchmark run: {n_variants} variants, "
+        f"ESM-2 model `{esm2_model}`, `random_seed={RANDOM_SEED}`.\n"
+    )
+    if "Last benchmark run:" not in updated:
+        # Insert after the last TBD/benchmark table line
+        marker = "| Random baseline"
+        idx = updated.find(marker)
+        if idx != -1:
+            end = updated.find("\n", idx) + 1
+            updated = updated[:end] + meta_note + updated[end:]
+
+    with open(readme_path, "w", encoding="utf-8") as fh:
+        fh.write(updated)
+    print(f"  [readme] updated {changed} table rows → {readme_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Phase 4 GB1 FLIP benchmark.")
     parser.add_argument("--n", type=int, default=TARGET_PER_QUARTILE,
-                        help=f"Variants per quartile (default {TARGET_PER_QUARTILE} → 100 total)")
+                        help=f"Variants per quartile (default {TARGET_PER_QUARTILE} -> 100 total)")
     parser.add_argument("--no-blast", action="store_true",
                         help="Skip BLAST stage (much faster, reduces accuracy)")
+    parser.add_argument("--model", default=DEFAULT_ESM2_MODEL,
+                        help=f"ESM-2 HuggingFace model name (default: {DEFAULT_ESM2_MODEL})")
     args = parser.parse_args()
 
     print("=" * 60)
     print("Phase 4 FLIP GB1 Benchmark")
     print("=" * 60)
+    print(f"ESM-2 model : {args.model}")
+    blast_backend = "skipped" if args.no_blast else ("local BLAST+" if local_blast_available() else "remote NCBI")
+    print(f"BLAST backend: {blast_backend}")
 
     # ------------------------------------------------------------------
     # 1. Load dataset + stratified sampling
@@ -349,6 +454,7 @@ def main() -> None:
             reference_pdb_path=REFERENCE_PDB,
             stream_callback=callback,
             blast_workers=0 if args.no_blast else 3,
+            esm2_model=args.model,
         )
     except Exception as exc:
         print(f"\nAgent pipeline failed: {exc}")
@@ -511,6 +617,15 @@ def main() -> None:
     with open(table_path, "w") as fh:
         fh.write(table_str + "\n")
     print(f"  [results] saved → {table_path}")
+
+    # ------------------------------------------------------------------
+    # 8. Auto-update README with real Spearman numbers
+    # ------------------------------------------------------------------
+    update_readme(
+        spearman=results_payload["spearman"],
+        n_variants=len(fitness_vals),
+        esm2_model=args.model,
+    )
 
     print("\nBenchmark complete.")
 
