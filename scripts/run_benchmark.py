@@ -101,11 +101,15 @@ def load_and_sample(data_path: str, n_per_quartile: int) -> tuple[pd.DataFrame, 
         duplicates="drop",
     )
 
-    sampled = (
-        df_vars.groupby("quartile", observed=True)
-        .apply(lambda g: g.sample(n=min(len(g), n_per_quartile), random_state=RANDOM_SEED))
-        .reset_index(drop=True)
-    )
+    # Use explicit loop instead of groupby().apply() to avoid pandas version
+    # differences where the group-key column gets promoted to index level and
+    # then lost on reset_index(drop=True).
+    sampled = pd.concat(
+        [
+            group.sample(n=min(len(group), n_per_quartile), random_state=RANDOM_SEED)
+            for _, group in df_vars.groupby("quartile", observed=True)
+        ]
+    ).reset_index(drop=True)
 
     return sampled, wt_seq
 

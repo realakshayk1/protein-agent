@@ -153,6 +153,16 @@ Thumbs.db
 
 # Project specific
 /esm_cache/
-/data/
 /reference_pdbs/*.pdb
 !/reference_pdbs/.gitkeep
+
+# Data directory — ignore generated caches and large DB files,
+# but track committed assets (gb1_fitness.csv, blast_db/.gitkeep)
+/data/blast_cache/
+/data/esmfold_cache/
+/data/blast_db/*.p??
+/data/blast_db/*.pal
+/data/blast_db/*.tar.gz
+
+# Benchmark outputs (generated on run, not committed)
+/scripts/results/
