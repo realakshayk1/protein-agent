@@ -1,0 +1,9 @@
+# Enforce LF line endings for all text files when checked out on any OS.
+# This prevents CRLF from breaking shell scripts on WSL/Linux.
+* text=auto eol=lf
+
+# Explicitly mark binary file types so git never mangles them
+*.pdb binary
+*.csv binary
+*.png binary
+*.jpg binary
