@@ -26,7 +26,9 @@ class TMAlignResult:
 
 @dataclass
 class BLASTResult:
-    conservation_score: float       # mean % identity at mutated positions, 0-1
+    conservation_score: float       # summed log-odds across mutated positions:
+                                    # Σ log P(variant_aa|MSA) - log P(wt_aa|MSA)
+                                    # positive = evolutionarily favoured substitution
     mutated_positions: list[int]
     n_hits: int
 

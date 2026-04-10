@@ -1,5 +1,23 @@
 """
-BLAST conservation scoring for protein variants.
+BLAST evolutionary log-odds scoring for protein variants.
+
+For each mutated position i the tool computes:
+
+    score_i = log P(variant_aa_i | homologs) - log P(wt_aa_i | homologs)
+
+where P(aa | homologs) is the empirical frequency of amino acid aa at
+position i across the top-50 BLAST hits (pseudocount ε = 0.01 added to
+avoid log(0)).  The conservation_score stored in BLASTResult is the sum of
+these per-position log-odds values across all mutated positions.
+
+Positive scores indicate the variant amino acid is more common in homologs
+than the wildtype amino acid at that position (evolutionarily favoured
+substitution).  Negative scores indicate the substitution is disfavoured.
+
+This replaces the previous "mean WT-conservation" approach, which measured
+how often the *wildtype* amino acid appeared in homologs — a quantity
+identical for all variants at the same position and therefore carrying zero
+information about fitness differences between variants.
 
 Backend priority:
   1. Local BLAST+ binary (blastp) + local SwissProt DB  — fast, offline, preferred
@@ -29,6 +47,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -43,9 +62,13 @@ from tools.interface import BLASTResult
 _CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "blast_cache")
 _DEFAULT_LOCAL_DB = os.path.join(os.path.dirname(__file__), "..", "data", "blast_db", "swissprot")
 
+_PSEUDOCOUNT = 0.01  # added to AA frequencies before log to avoid log(0)
 
-def _cache_key(sequence: str, mutated_positions: list[int]) -> str:
+
+def _cache_key(sequence: str, mutated_positions: list[int], wildtype_seq: str | None) -> str:
     payload = sequence.upper() + ":" + ",".join(str(p) for p in sorted(mutated_positions))
+    if wildtype_seq is not None:
+        payload += ":" + wildtype_seq.upper()
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -105,18 +128,29 @@ def local_blast_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Shared conservation computation (same logic for both backends)
+# Shared log-odds computation (same logic for both backends)
 # ---------------------------------------------------------------------------
 
-def _conservation_from_record(
+def _logodds_from_record(
     blast_record,
     sequence: str,
     mutated_positions: list[int],
+    wildtype_seq: str | None,
 ) -> tuple[float, int]:
     """
-    Extract mean conservation score from a parsed BLAST record.
+    Compute summed log-odds score from a parsed BLAST record.
 
-    Returns (mean_conservation_score, n_hits).
+    For each mutated position i, counts the frequency of:
+      - variant_aa_i  (from `sequence`)
+      - wt_aa_i       (from `wildtype_seq`, if provided)
+    across up to 50 BLAST hits.  Returns:
+
+        score = Σ_i  log(P(variant_aa_i) + ε) - log(P(wt_aa_i) + ε)
+
+    When wildtype_seq is None (backward-compat mode), falls back to
+    log P(variant_aa_i) — a weaker but still informative single-sided score.
+
+    Returns (score, n_hits).
     """
     alignments = blast_record.alignments
     n_hits = len(alignments)
@@ -124,12 +158,15 @@ def _conservation_from_record(
     if n_hits == 0:
         return 0.0, 0
 
-    total_conservation = 0.0
+    total_logodds = 0.0
 
     for pos in mutated_positions:
-        query_aa = sequence[pos].upper()
-        matches = 0
-        valid_hits_for_pos = 0
+        variant_aa = sequence[pos].upper()
+        wt_aa = wildtype_seq[pos].upper() if wildtype_seq is not None else None
+
+        variant_count = 0
+        wt_count = 0
+        valid_hits = 0
 
         for alignment in alignments[:50]:
             hsp = alignment.hsps[0]
@@ -138,6 +175,7 @@ def _conservation_from_record(
             q_end = q_start + len(hsp.query.replace("-", ""))
 
             if q_start <= pos < q_end:
+                # Walk the alignment to find subject residue at query position
                 q_idx = q_start
                 aln_idx = 0
                 while q_idx < pos and aln_idx < len(hsp.query):
@@ -146,23 +184,34 @@ def _conservation_from_record(
                     aln_idx += 1
 
                 if aln_idx < len(hsp.sbjct):
-                    sbjct_aa = hsp.sbjct[aln_idx]
-                    if sbjct_aa.upper() == query_aa:
-                        matches += 1
-                    valid_hits_for_pos += 1
+                    sbjct_aa = hsp.sbjct[aln_idx].upper()
+                    if sbjct_aa == variant_aa:
+                        variant_count += 1
+                    if wt_aa is not None and sbjct_aa == wt_aa:
+                        wt_count += 1
+                    valid_hits += 1
 
-        if valid_hits_for_pos > 0:
-            total_conservation += matches / valid_hits_for_pos
+        if valid_hits > 0:
+            p_variant = (variant_count / valid_hits) + _PSEUDOCOUNT
+            if wt_aa is not None:
+                p_wt = (wt_count / valid_hits) + _PSEUDOCOUNT
+                total_logodds += math.log(p_variant) - math.log(p_wt)
+            else:
+                # Fallback: single-sided log frequency
+                total_logodds += math.log(p_variant)
 
-    mean_score = total_conservation / len(mutated_positions) if mutated_positions else 0.0
-    return mean_score, n_hits
+    return total_logodds, n_hits
 
 
 # ---------------------------------------------------------------------------
 # Local BLAST+ backend
 # ---------------------------------------------------------------------------
 
-def _blast_local(sequence: str, mutated_positions: list[int]) -> BLASTResult:
+def _blast_local(
+    sequence: str,
+    mutated_positions: list[int],
+    wildtype_seq: str | None,
+) -> BLASTResult:
     """Run blastp against a local SwissProt database."""
     db_path = os.environ.get("BLAST_LOCAL_DB", _DEFAULT_LOCAL_DB)
 
@@ -204,9 +253,9 @@ def _blast_local(sequence: str, mutated_positions: list[int]) -> BLASTResult:
         with open(out_path) as fh:
             blast_record = NCBIXML.read(fh)
 
-    mean_score, n_hits = _conservation_from_record(blast_record, sequence, mutated_positions)
+    score, n_hits = _logodds_from_record(blast_record, sequence, mutated_positions, wildtype_seq)
     return BLASTResult(
-        conservation_score=mean_score,
+        conservation_score=score,
         mutated_positions=mutated_positions,
         n_hits=n_hits,
     )
@@ -216,7 +265,12 @@ def _blast_local(sequence: str, mutated_positions: list[int]) -> BLASTResult:
 # Remote NCBI BLAST backend
 # ---------------------------------------------------------------------------
 
-def _blast_remote(sequence: str, mutated_positions: list[int], db: str) -> BLASTResult:
+def _blast_remote(
+    sequence: str,
+    mutated_positions: list[int],
+    wildtype_seq: str | None,
+    db: str,
+) -> BLASTResult:
     """Run blastp against the NCBI remote API."""
     try:
         result_handle = NCBIWWW.qblast(
@@ -233,9 +287,9 @@ def _blast_remote(sequence: str, mutated_positions: list[int], db: str) -> BLAST
     finally:
         result_handle.close()
 
-    mean_score, n_hits = _conservation_from_record(blast_record, sequence, mutated_positions)
+    score, n_hits = _logodds_from_record(blast_record, sequence, mutated_positions, wildtype_seq)
     return BLASTResult(
-        conservation_score=mean_score,
+        conservation_score=score,
         mutated_positions=mutated_positions,
         n_hits=n_hits,
     )
@@ -248,27 +302,38 @@ def _blast_remote(sequence: str, mutated_positions: list[int], db: str) -> BLAST
 def blast_conservation(
     sequence: str,
     mutated_positions: list[int],
+    wildtype_seq: str | None = None,
     db: str = "swissprot",
     use_cache: bool = True,
 ) -> BLASTResult:
     """
-    Assess evolutionary conservation at mutated positions via BLAST.
+    Compute evolutionary log-odds scores at mutated positions via BLAST.
+
+    For each mutated position i, the returned conservation_score is:
+
+        Σ_i  log P(variant_aa_i | MSA) - log P(wt_aa_i | MSA)
+
+    where P is estimated from the top-50 BLAST hit frequencies
+    (pseudocount ε=0.01).  Positive = evolutionarily favoured substitution.
 
     Automatically uses the local BLAST+ binary + SwissProt DB if available
     (set BLAST_LOCAL_DB env var or place db at data/blast_db/swissprot).
     Falls back to remote NCBI BLAST when local is not set up.
 
     Results are cached to data/blast_cache/ keyed by SHA-256 of
-    (sequence, mutated_positions) — repeat calls are instant.
+    (sequence, mutated_positions, wildtype_seq) — repeat calls are instant.
 
     Args:
-        sequence: Protein amino acid sequence.
+        sequence:          Variant protein sequence.
         mutated_positions: 0-indexed positions where mutations occurred.
-        db: NCBI database name used only for the remote fallback (default: swissprot).
-        use_cache: Read/write the disk cache (default True).
+        wildtype_seq:      Wildtype sequence (same length as sequence).
+                           Required for full log-odds scoring; when None
+                           falls back to log P(variant_aa) only.
+        db:                NCBI database name (remote fallback only).
+        use_cache:         Read/write the disk cache (default True).
 
     Returns:
-        BLASTResult with mean conservation score across mutated positions.
+        BLASTResult with summed log-odds conservation_score.
     """
     if not mutated_positions:
         raise ValueError("mutated_positions cannot be empty")
@@ -280,8 +345,8 @@ def blast_conservation(
         raise ValueError("Sequence contains invalid amino acid characters")
 
     # Cache read
-    key = _cache_key(sequence, mutated_positions) if use_cache else None
-    if use_cache:
+    key = _cache_key(sequence, mutated_positions, wildtype_seq) if use_cache else None
+    if use_cache and key:
         cached = _load_cache(key)
         if cached is not None:
             return cached
@@ -289,12 +354,12 @@ def blast_conservation(
     # Backend selection
     if local_blast_available():
         logging.info("BLAST: using local BLAST+ backend")
-        result = _blast_local(sequence, mutated_positions)
+        result = _blast_local(sequence, mutated_positions, wildtype_seq)
     else:
         logging.info("BLAST: local DB not found — using remote NCBI backend")
-        result = _blast_remote(sequence, mutated_positions, db)
+        result = _blast_remote(sequence, mutated_positions, wildtype_seq, db)
 
-    if use_cache:
+    if use_cache and key:
         _save_cache(key, result)
 
     return result

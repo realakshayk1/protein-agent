@@ -2,11 +2,21 @@ import numpy as np
 from scipy.stats import rankdata
 from tools.interface import RankerResult
 
+# Weight rationale:
+#   llr (0.40)          — ESM-2 focused masked marginal, strong sequence signal
+#   local_plddt (0.20)  — pLDDT at mutated positions only, more discriminative
+#                          than global mean for interface mutations
+#   tm_score (0.20)     — fold preservation relative to WT, captures large
+#                          structural disruptions
+#   conservation (0.10) — BLAST log-odds at mutated positions (evolutionary)
+#   mean_plddt (0.10)   — global structural confidence, down-weighted because
+#                          it largely correlates with local_plddt
 DEFAULT_WEIGHTS = {
     "llr": 0.40,
-    "mean_plddt": 0.25,
+    "local_plddt": 0.20,
     "tm_score": 0.20,
-    "conservation_score": 0.15,
+    "conservation_score": 0.10,
+    "mean_plddt": 0.10,
 }
 
 def rank_candidates(candidates: list[dict], weights: dict = None) -> RankerResult:
@@ -15,10 +25,10 @@ def rank_candidates(candidates: list[dict], weights: dict = None) -> RankerResul
 
     Args:
         candidates: List of candidate dicts, each with keys:
-                    llr, mean_plddt, tm_score, conservation_score.
+                    llr, local_plddt, mean_plddt, tm_score, conservation_score.
         weights: Optional dict of per-metric weights. Must sum to 1.0 ± 0.01.
-                 Defaults to {llr: 0.40, mean_plddt: 0.25, tm_score: 0.20,
-                 conservation_score: 0.15}.
+                 Defaults to {llr:0.40, local_plddt:0.20, tm_score:0.20,
+                 conservation_score:0.10, mean_plddt:0.10}.
 
     Returns:
         RankerResult with ranked_candidates (sorted desc by composite_score)
@@ -34,7 +44,7 @@ def rank_candidates(candidates: list[dict], weights: dict = None) -> RankerResul
             f"Weights must sum to 1.0 ± 0.01, got {sum(w.values()):.4f}"
         )
 
-    metrics = ["llr", "mean_plddt", "tm_score", "conservation_score"]
+    metrics = list(w.keys())
 
     # Build score matrix — missing keys become NaN
     scores = np.array(
@@ -58,7 +68,6 @@ def rank_candidates(candidates: list[dict], weights: dict = None) -> RankerResul
     composite = ranks @ weight_vec
 
     # Attach scores and ranks back to candidate dicts (copies, not mutations)
-    n = len(candidates)
     result_candidates = []
     composite_ranks = rankdata(-composite)  # rank 1 = highest composite
 
