@@ -46,8 +46,9 @@ README_PATH = os.path.join(os.path.dirname(__file__), "..", "README.md")
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 RANDOM_SEED = 42
 TARGET_PER_QUARTILE = 25      # 4 x 25 = 100 total variants
-# PRD specifies esm2_t12_35M for the production benchmark (vs. 8M for dev/tests)
-DEFAULT_ESM2_MODEL = "esm2_t12_35M_UR50D"
+# 650M model with focused masked marginal scoring is the production default.
+# Override with --model esm2_t12_35M_UR50D for faster smoke tests.
+DEFAULT_ESM2_MODEL = "esm2_t33_650M_UR50D"
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +185,9 @@ def build_ablation_grid(
 
     tools = [
         ("ESM-2 LLR", esm2_scores),
-        ("ESMFold pLDDT", plddt_scores),
+        ("Local pLDDT (mutated pos)", plddt_scores),
         ("TM-score", tm_scores),
-        ("BLAST conservation", blast_scores),
+        ("BLAST log-odds", blast_scores),
     ]
     fig, axes = plt.subplots(2, 2, figsize=(10, 9))
     y = np.array(fitness)
@@ -477,6 +478,7 @@ def main() -> None:
     composite_vals: list[float] = []
     esm2_vals: list[float] = []
     plddt_vals: list[float] = []
+    local_plddt_vals: list[float] = []
     tm_vals: list[float] = []
     blast_vals: list[float] = []
 
@@ -486,34 +488,45 @@ def main() -> None:
         composite_vals.append(cand.get("composite_score", 0.0))
         esm2_vals.append(cand.get("llr", 0.0))
         plddt_vals.append(cand.get("mean_plddt", 0.0))
+        local_plddt_vals.append(cand.get("local_plddt", cand.get("mean_plddt", 0.0)))
         tm_vals.append(cand.get("tm_score", 0.0))
         blast_vals.append(cand.get("conservation_score", 0.0))
 
     # ------------------------------------------------------------------
     # 4. Spearman correlations
     # ------------------------------------------------------------------
-    rho_full, p_full   = safe_spearman(composite_vals, fitness_vals)
-    rho_esm2, p_esm2   = safe_spearman(esm2_vals,      fitness_vals)
-    rho_plddt, p_plddt = safe_spearman(plddt_vals,     fitness_vals)
-    rho_tm, p_tm       = safe_spearman(tm_vals,        fitness_vals)
-    rho_blast, p_blast = safe_spearman(blast_vals,     fitness_vals)
+    rho_full,       p_full       = safe_spearman(composite_vals,   fitness_vals)
+    rho_esm2,       p_esm2       = safe_spearman(esm2_vals,         fitness_vals)
+    rho_plddt,      p_plddt      = safe_spearman(plddt_vals,        fitness_vals)
+    rho_local_plddt, p_local_plddt = safe_spearman(local_plddt_vals, fitness_vals)
+    rho_tm,         p_tm         = safe_spearman(tm_vals,           fitness_vals)
+    rho_blast,      p_blast      = safe_spearman(blast_vals,        fitness_vals)
+
+    triage = agent_result.get("triage_summary", {})
+    triage_line = (
+        f"Triage: {triage.get('n_uncertain', 'N/A')} uncertain / "
+        f"{triage.get('n_confident', 'N/A')} confident"
+        if triage.get("enabled") else "Triage: disabled"
+    )
 
     table_lines = [
-        "=" * 55,
+        "=" * 59,
         "BENCHMARK RESULTS — Spearman ρ vs. Experimental Fitness",
         f"  Dataset: FLIP GB1  |  N = {len(fitness_vals)} variants",
-        "=" * 55,
-        f"{'Condition':<28} {'Spearman ρ':>10}  {'p-value':>10}",
-        "-" * 55,
-        f"{'Full Agent (all 4 tools)':<28} {rho_full:>10.3f}  {p_full:>10.4f}",
-        f"{'ESM-2 LLR only':<28} {rho_esm2:>10.3f}  {p_esm2:>10.4f}",
-        f"{'ESMFold pLDDT only':<28} {rho_plddt:>10.3f}  {p_plddt:>10.4f}",
-        f"{'TM-score only':<28} {rho_tm:>10.3f}  {p_tm:>10.4f}",
-        f"{'BLAST conservation only':<28} {rho_blast:>10.3f}  {p_blast:>10.4f}",
-        f"{'Random baseline':<28} {'~0.000':>10}  {'N/A':>10}",
-        "=" * 55,
+        "=" * 59,
+        f"{'Condition':<32} {'Spearman ρ':>10}  {'p-value':>10}",
+        "-" * 59,
+        f"{'Full Agent (all 5 signals)':<32} {rho_full:>10.3f}  {p_full:>10.4f}",
+        f"{'ESM-2 LLR only':<32} {rho_esm2:>10.3f}  {p_esm2:>10.4f}",
+        f"{'ESMFold pLDDT only':<32} {rho_plddt:>10.3f}  {p_plddt:>10.4f}",
+        f"{'Local pLDDT (mutated pos)':<32} {rho_local_plddt:>10.3f}  {p_local_plddt:>10.4f}",
+        f"{'TM-score only':<32} {rho_tm:>10.3f}  {p_tm:>10.4f}",
+        f"{'BLAST log-odds only':<32} {rho_blast:>10.3f}  {p_blast:>10.4f}",
+        f"{'Random baseline':<32} {'~0.000':>10}  {'N/A':>10}",
+        "=" * 59,
         f"Wall time: {wall_time:.1f}s  |  Imputed: {agent_result.get('imputed_count', 0)}",
-        "=" * 55,
+        triage_line,
+        "=" * 59,
     ]
     table_str = "\n".join(table_lines)
     print("\n" + table_str)
@@ -563,7 +576,7 @@ def main() -> None:
     build_ablation_grid(
         fitness=fitness_vals,
         esm2_scores=esm2_vals,
-        plddt_scores=plddt_vals,
+        plddt_scores=local_plddt_vals,
         tm_scores=tm_vals,
         blast_scores=blast_vals,
         out_path=os.path.join(RESULTS_DIR, "scatter_ablations.png"),
@@ -600,12 +613,14 @@ def main() -> None:
             "weights_used": agent_result.get("weights_used", {}),
         },
         "spearman": {
-            "full_agent": {"rho": round(rho_full, 4), "p": round(p_full, 6)},
-            "esm2_only":  {"rho": round(rho_esm2, 4), "p": round(p_esm2, 6)},
-            "plddt_only": {"rho": round(rho_plddt, 4), "p": round(p_plddt, 6)},
-            "tm_only":    {"rho": round(rho_tm, 4), "p": round(p_tm, 6)},
-            "blast_only": {"rho": round(rho_blast, 4), "p": round(p_blast, 6)},
+            "full_agent":       {"rho": round(rho_full, 4),        "p": round(p_full, 6)},
+            "esm2_only":        {"rho": round(rho_esm2, 4),        "p": round(p_esm2, 6)},
+            "plddt_only":       {"rho": round(rho_plddt, 4),       "p": round(p_plddt, 6)},
+            "local_plddt_only": {"rho": round(rho_local_plddt, 4), "p": round(p_local_plddt, 6)},
+            "tm_only":          {"rho": round(rho_tm, 4),          "p": round(p_tm, 6)},
+            "blast_only":       {"rho": round(rho_blast, 4),       "p": round(p_blast, 6)},
         },
+        "triage_summary": triage,
         "edge_cases": edge_cases,
         "ranked_candidates": ranked_cands,
     }
