@@ -3,10 +3,9 @@ BLAST conservation scoring for protein variants.
 
 Backend priority:
   1. Local BLAST+ binary (blastp) + local SwissProt DB  — fast, offline, preferred
-  2. Remote NCBI BLAST API                              — fallback if local unavailable
-
-Both paths share the same disk cache (data/blast_cache/) so results are free on
-any repeat call regardless of which backend ran first.
+  2. Remote NCBI BLAST API                              — network fallback
+  3. BLOSUM62 substitution score                        — zero-dependency fallback,
+     used automatically when both BLAST backends are unavailable or fail.
 
 Local BLAST+ setup (one-time, ~600 MB):
     # Install BLAST+
@@ -105,7 +104,77 @@ def local_blast_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Shared conservation computation (same logic for both backends)
+# BLOSUM62 fallback (zero external dependencies)
+# ---------------------------------------------------------------------------
+
+def _get_blosum62():
+    """Load BLOSUM62 matrix via BioPython (already a project dependency)."""
+    try:
+        from Bio.Align import substitution_matrices
+        return substitution_matrices.load("BLOSUM62")
+    except Exception:
+        return None
+
+
+def blosum62_conservation(
+    variant_seq: str,
+    wildtype_seq: str,
+    mutated_positions: list[int],
+) -> BLASTResult:
+    """
+    Estimate evolutionary conservation via BLOSUM62 substitution scores.
+
+    BLOSUM62 encodes log-odds of observing a substitution in aligned homologs.
+    Higher scores mean more conserved / biochemically similar substitutions.
+    This is used as a zero-dependency fallback when BLAST is unavailable.
+
+    The per-position BLOSUM62 scores are averaged across all mutated positions
+    and min-max normalised to [0, 1] using the empirical score range of the
+    matrix (min ≈ −4 typical for common AAs, max = 11 for Cys→Cys).
+
+    Args:
+        variant_seq:       Full variant amino-acid sequence.
+        wildtype_seq:      Full wildtype amino-acid sequence (same length).
+        mutated_positions: 0-indexed positions where mutations occurred.
+
+    Returns:
+        BLASTResult with conservation_score in [0, 1] and n_hits = 0 to signal
+        that this is a BLOSUM-derived (not BLAST-derived) score.
+    """
+    blosum = _get_blosum62()
+    if blosum is None or not mutated_positions:
+        return BLASTResult(conservation_score=0.5, mutated_positions=mutated_positions, n_hits=0)
+
+    # Empirical BLOSUM62 range for common 20 AAs: roughly [-4, 11]
+    BLOSUM_MIN = -4.0
+    BLOSUM_MAX = 11.0
+
+    total = 0.0
+    valid = 0
+    for pos in mutated_positions:
+        wt_aa  = wildtype_seq[pos].upper()
+        var_aa = variant_seq[pos].upper()
+        try:
+            score = blosum[wt_aa, var_aa]
+            # Normalise to [0, 1]
+            normalised = (score - BLOSUM_MIN) / (BLOSUM_MAX - BLOSUM_MIN)
+            normalised = max(0.0, min(1.0, normalised))
+            total += normalised
+            valid += 1
+        except KeyError:
+            continue  # non-standard AA — skip
+
+    mean_score = total / valid if valid > 0 else 0.5
+
+    return BLASTResult(
+        conservation_score=mean_score,
+        mutated_positions=mutated_positions,
+        n_hits=0,  # 0 = BLOSUM-derived, not BLAST-derived
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared conservation computation (same logic for both BLAST backends)
 # ---------------------------------------------------------------------------
 
 def _conservation_from_record(
@@ -250,25 +319,30 @@ def blast_conservation(
     mutated_positions: list[int],
     db: str = "swissprot",
     use_cache: bool = True,
+    wildtype_seq: str | None = None,
+    allow_blosum_fallback: bool = True,
 ) -> BLASTResult:
     """
-    Assess evolutionary conservation at mutated positions via BLAST.
+    Assess evolutionary conservation at mutated positions.
 
-    Automatically uses the local BLAST+ binary + SwissProt DB if available
-    (set BLAST_LOCAL_DB env var or place db at data/blast_db/swissprot).
-    Falls back to remote NCBI BLAST when local is not set up.
+    Backend selection (in order):
+      1. Local BLAST+ + SwissProt DB (if available)
+      2. Remote NCBI BLAST API
+      3. BLOSUM62 substitution scores (if allow_blosum_fallback=True and
+         wildtype_seq is provided)
 
-    Results are cached to data/blast_cache/ keyed by SHA-256 of
-    (sequence, mutated_positions) — repeat calls are instant.
+    Results from BLAST backends are cached to data/blast_cache/.
 
     Args:
-        sequence: Protein amino acid sequence.
-        mutated_positions: 0-indexed positions where mutations occurred.
-        db: NCBI database name used only for the remote fallback (default: swissprot).
-        use_cache: Read/write the disk cache (default True).
+        sequence:              Protein amino acid sequence (the variant).
+        mutated_positions:     0-indexed positions where mutations occurred.
+        db:                    NCBI database name for remote fallback.
+        use_cache:             Read/write the disk cache (default True).
+        wildtype_seq:          Wildtype sequence — required for BLOSUM62 fallback.
+        allow_blosum_fallback: Fall back to BLOSUM62 when BLAST unavailable.
 
     Returns:
-        BLASTResult with mean conservation score across mutated positions.
+        BLASTResult.  n_hits == 0 indicates a BLOSUM62-derived score.
     """
     if not mutated_positions:
         raise ValueError("mutated_positions cannot be empty")
@@ -279,7 +353,7 @@ def blast_conservation(
     if not all(c.upper() in valid_aa for c in sequence):
         raise ValueError("Sequence contains invalid amino acid characters")
 
-    # Cache read
+    # Cache read (only for real BLAST results)
     key = _cache_key(sequence, mutated_positions) if use_cache else None
     if use_cache:
         cached = _load_cache(key)
@@ -287,14 +361,29 @@ def blast_conservation(
             return cached
 
     # Backend selection
-    if local_blast_available():
-        logging.info("BLAST: using local BLAST+ backend")
-        result = _blast_local(sequence, mutated_positions)
-    else:
-        logging.info("BLAST: local DB not found — using remote NCBI backend")
-        result = _blast_remote(sequence, mutated_positions, db)
+    blast_result: BLASTResult | None = None
+    try:
+        if local_blast_available():
+            logging.info("BLAST: using local BLAST+ backend")
+            blast_result = _blast_local(sequence, mutated_positions)
+        else:
+            logging.info("BLAST: local DB not found — using remote NCBI backend")
+            blast_result = _blast_remote(sequence, mutated_positions, db)
+    except Exception as exc:
+        logging.warning(f"BLAST failed: {exc}")
 
-    if use_cache:
-        _save_cache(key, result)
+    if blast_result is not None:
+        if use_cache:
+            _save_cache(key, blast_result)
+        return blast_result
 
-    return result
+    # BLOSUM62 fallback
+    if allow_blosum_fallback and wildtype_seq is not None:
+        logging.info("BLAST: all backends failed — using BLOSUM62 fallback")
+        return blosum62_conservation(sequence, wildtype_seq, mutated_positions)
+
+    # Hard failure (no fallback available)
+    raise RuntimeError(
+        "All BLAST backends failed and no BLOSUM62 fallback available. "
+        "Pass wildtype_seq to enable BLOSUM62 fallback."
+    )

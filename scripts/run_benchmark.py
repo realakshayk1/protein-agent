@@ -387,22 +387,61 @@ def update_readme(
 # Main
 # ---------------------------------------------------------------------------
 
+def _parse_domain_slice(s: str) -> tuple[int, int]:
+    """Parse 'start:end' string into (start, end) tuple."""
+    try:
+        parts = s.split(":")
+        return int(parts[0]), int(parts[1])
+    except Exception:
+        raise argparse.ArgumentTypeError(
+            f"domain-slice must be 'start:end' (e.g. '0:56'), got: {s!r}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Phase 4 GB1 FLIP benchmark.")
     parser.add_argument("--n", type=int, default=TARGET_PER_QUARTILE,
                         help=f"Variants per quartile (default {TARGET_PER_QUARTILE} -> 100 total)")
     parser.add_argument("--no-blast", action="store_true",
-                        help="Skip BLAST stage (much faster, reduces accuracy)")
+                        help="Skip BLAST stage (BLOSUM62 fallback still runs)")
     parser.add_argument("--model", default=DEFAULT_ESM2_MODEL,
                         help=f"ESM-2 HuggingFace model name (default: {DEFAULT_ESM2_MODEL})")
+    parser.add_argument("--domain-slice", type=_parse_domain_slice, default=None,
+                        metavar="START:END",
+                        help="Restrict ESM-2 scoring to a domain sub-sequence. "
+                             "Example: --domain-slice 0:56 for the 56-aa GB1 domain.")
+    parser.add_argument("--weights", type=str, default=None,
+                        metavar="KEY=VAL,...",
+                        help="Override ranker weights as comma-separated key=value pairs. "
+                             "Must sum to 1.0.  Example: "
+                             "--weights tm_score=0.5,mean_plddt=0.3,llr=0.2")
     args = parser.parse_args()
+
+    # Parse custom weights if provided
+    custom_weights = None
+    if args.weights:
+        try:
+            custom_weights = {}
+            for item in args.weights.split(","):
+                k, v = item.strip().split("=")
+                custom_weights[k.strip()] = float(v.strip())
+        except Exception as exc:
+            print(f"ERROR: could not parse --weights: {exc}")
+            sys.exit(1)
 
     print("=" * 60)
     print("Phase 4 FLIP GB1 Benchmark")
     print("=" * 60)
-    print(f"ESM-2 model : {args.model}")
-    blast_backend = "skipped" if args.no_blast else ("local BLAST+" if local_blast_available() else "remote NCBI")
-    print(f"BLAST backend: {blast_backend}")
+    print(f"ESM-2 model   : {args.model}")
+    blast_backend = "skipped (BLOSUM62 fallback)" if args.no_blast else (
+        "local BLAST+" if local_blast_available() else "remote NCBI → BLOSUM62 fallback"
+    )
+    print(f"BLAST backend : {blast_backend}")
+    if args.domain_slice:
+        print(f"Domain slice  : [{args.domain_slice[0]}, {args.domain_slice[1]}) "
+              f"({args.domain_slice[1] - args.domain_slice[0]} aa)")
+    if custom_weights:
+        print(f"Custom weights: {custom_weights}")
 
     # ------------------------------------------------------------------
     # 1. Load dataset + stratified sampling
@@ -459,6 +498,8 @@ def main() -> None:
             stream_callback=callback,
             blast_workers=0 if args.no_blast else 3,
             esm2_model=args.model,
+            domain_slice=args.domain_slice,
+            custom_weights=custom_weights,
         )
     except Exception as exc:
         print(f"\nAgent pipeline failed: {exc}")
@@ -476,44 +517,61 @@ def main() -> None:
     fitness_vals: list[float] = []
     composite_vals: list[float] = []
     esm2_vals: list[float] = []
+    llr_per_mut_vals: list[float] = []
     plddt_vals: list[float] = []
+    local_plddt_vals: list[float] = []
+    delta_local_plddt_vals: list[float] = []
     tm_vals: list[float] = []
     blast_vals: list[float] = []
+    neg_rmsd_vals: list[float] = []
 
     for cand in ranked_cands:
         cid = cand["candidate_id"]
         fitness_vals.append(experimental_fitness[cid])
         composite_vals.append(cand.get("composite_score", 0.0))
         esm2_vals.append(cand.get("llr", 0.0))
+        llr_per_mut_vals.append(cand.get("llr_per_mut", 0.0))
         plddt_vals.append(cand.get("mean_plddt", 0.0))
+        local_plddt_vals.append(cand.get("local_plddt", 0.0))
+        delta_local_plddt_vals.append(cand.get("delta_local_plddt", 0.0))
         tm_vals.append(cand.get("tm_score", 0.0))
         blast_vals.append(cand.get("conservation_score", 0.0))
+        neg_rmsd_vals.append(cand.get("neg_rmsd", 0.0))
 
     # ------------------------------------------------------------------
     # 4. Spearman correlations
     # ------------------------------------------------------------------
-    rho_full, p_full   = safe_spearman(composite_vals, fitness_vals)
-    rho_esm2, p_esm2   = safe_spearman(esm2_vals,      fitness_vals)
-    rho_plddt, p_plddt = safe_spearman(plddt_vals,     fitness_vals)
-    rho_tm, p_tm       = safe_spearman(tm_vals,        fitness_vals)
-    rho_blast, p_blast = safe_spearman(blast_vals,     fitness_vals)
+    rho_full,        p_full        = safe_spearman(composite_vals,        fitness_vals)
+    rho_esm2,        p_esm2        = safe_spearman(esm2_vals,             fitness_vals)
+    rho_llr_per_mut, p_llr_per_mut = safe_spearman(llr_per_mut_vals,      fitness_vals)
+    rho_plddt,       p_plddt       = safe_spearman(plddt_vals,            fitness_vals)
+    rho_loc_plddt,   p_loc_plddt   = safe_spearman(local_plddt_vals,      fitness_vals)
+    rho_dlt_plddt,   p_dlt_plddt   = safe_spearman(delta_local_plddt_vals,fitness_vals)
+    rho_tm,          p_tm          = safe_spearman(tm_vals,               fitness_vals)
+    rho_blast,       p_blast       = safe_spearman(blast_vals,            fitness_vals)
+    rho_rmsd,        p_rmsd        = safe_spearman(neg_rmsd_vals,         fitness_vals)
 
     table_lines = [
-        "=" * 55,
+        "=" * 60,
         "BENCHMARK RESULTS — Spearman ρ vs. Experimental Fitness",
         f"  Dataset: FLIP GB1  |  N = {len(fitness_vals)} variants",
-        "=" * 55,
-        f"{'Condition':<28} {'Spearman ρ':>10}  {'p-value':>10}",
-        "-" * 55,
-        f"{'Full Agent (all 4 tools)':<28} {rho_full:>10.3f}  {p_full:>10.4f}",
-        f"{'ESM-2 LLR only':<28} {rho_esm2:>10.3f}  {p_esm2:>10.4f}",
-        f"{'ESMFold pLDDT only':<28} {rho_plddt:>10.3f}  {p_plddt:>10.4f}",
-        f"{'TM-score only':<28} {rho_tm:>10.3f}  {p_tm:>10.4f}",
-        f"{'BLAST conservation only':<28} {rho_blast:>10.3f}  {p_blast:>10.4f}",
-        f"{'Random baseline':<28} {'~0.000':>10}  {'N/A':>10}",
-        "=" * 55,
+        "=" * 60,
+        f"{'Condition':<32} {'Spearman ρ':>10}  {'p-value':>10}",
+        "-" * 60,
+        f"{'Full Agent (all signals)':<32} {rho_full:>10.3f}  {p_full:>10.4f}",
+        "-" * 60,
+        f"{'ESM-2 LLR only':<32} {rho_esm2:>10.3f}  {p_esm2:>10.4f}",
+        f"{'ESM-2 LLR/n_mut only':<32} {rho_llr_per_mut:>10.3f}  {p_llr_per_mut:>10.4f}",
+        f"{'ESMFold mean pLDDT only':<32} {rho_plddt:>10.3f}  {p_plddt:>10.4f}",
+        f"{'ESMFold local pLDDT only':<32} {rho_loc_plddt:>10.3f}  {p_loc_plddt:>10.4f}",
+        f"{'delta local pLDDT only':<32} {rho_dlt_plddt:>10.3f}  {p_dlt_plddt:>10.4f}",
+        f"{'TM-score only':<32} {rho_tm:>10.3f}  {p_tm:>10.4f}",
+        f"{'neg-RMSD only':<32} {rho_rmsd:>10.3f}  {p_rmsd:>10.4f}",
+        f"{'BLAST/BLOSUM62 only':<32} {rho_blast:>10.3f}  {p_blast:>10.4f}",
+        f"{'Random baseline':<32} {'~0.000':>10}  {'N/A':>10}",
+        "=" * 60,
         f"Wall time: {wall_time:.1f}s  |  Imputed: {agent_result.get('imputed_count', 0)}",
-        "=" * 55,
+        "=" * 60,
     ]
     table_str = "\n".join(table_lines)
     print("\n" + table_str)
@@ -598,13 +656,19 @@ def main() -> None:
             "wall_time_seconds": round(wall_time, 1),
             "imputed_count": agent_result.get("imputed_count", 0),
             "weights_used": agent_result.get("weights_used", {}),
+            "esm2_model": args.model,
+            "domain_slice": list(args.domain_slice) if args.domain_slice else None,
         },
         "spearman": {
-            "full_agent": {"rho": round(rho_full, 4), "p": round(p_full, 6)},
-            "esm2_only":  {"rho": round(rho_esm2, 4), "p": round(p_esm2, 6)},
-            "plddt_only": {"rho": round(rho_plddt, 4), "p": round(p_plddt, 6)},
-            "tm_only":    {"rho": round(rho_tm, 4), "p": round(p_tm, 6)},
-            "blast_only": {"rho": round(rho_blast, 4), "p": round(p_blast, 6)},
+            "full_agent":       {"rho": round(rho_full,        4), "p": round(p_full,        6)},
+            "esm2_only":        {"rho": round(rho_esm2,        4), "p": round(p_esm2,        6)},
+            "llr_per_mut_only": {"rho": round(rho_llr_per_mut, 4), "p": round(p_llr_per_mut, 6)},
+            "plddt_only":       {"rho": round(rho_plddt,       4), "p": round(p_plddt,       6)},
+            "local_plddt_only": {"rho": round(rho_loc_plddt,   4), "p": round(p_loc_plddt,   6)},
+            "delta_plddt_only": {"rho": round(rho_dlt_plddt,   4), "p": round(p_dlt_plddt,   6)},
+            "tm_only":          {"rho": round(rho_tm,          4), "p": round(p_tm,          6)},
+            "neg_rmsd_only":    {"rho": round(rho_rmsd,        4), "p": round(p_rmsd,        6)},
+            "blast_only":       {"rho": round(rho_blast,       4), "p": round(p_blast,       6)},
         },
         "edge_cases": edge_cases,
         "ranked_candidates": ranked_cands,
